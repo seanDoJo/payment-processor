@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 /// Represents a client capable of storing and retrieving transactions.
 pub trait TxStore: Default {
@@ -20,6 +20,8 @@ pub enum TxState {
     Deposit(f32),
     /// A transaction whose funds being held for dispute.
     Dispute(f32),
+    /// A transaction representing withdrawn funds.
+    Withdrawal,
 }
 
 /// An in-memory transaction store backed by a [`HashMap`].
@@ -40,7 +42,7 @@ pub enum TxState {
 #[derive(Default, Debug)]
 pub struct MemoryStore {
     #[doc(hidden)]
-    transactions: HashMap<u16, HashMap<u32, TxState>>,
+    transactions: HashMap<u32, (u16, TxState)>,
 }
 
 impl MemoryStore {
@@ -53,25 +55,28 @@ impl MemoryStore {
 
 impl TxStore for Arc<Mutex<MemoryStore>> {
     fn get(&self, client_id: u16, tx_id: u32) -> Option<TxState> {
-        self.lock()
-            .unwrap()
-            .transactions
-            .get(&client_id)?
-            .get(&tx_id)
-            .cloned()
+        let (cid, tx) = self.lock().unwrap().transactions.get(&tx_id).cloned()?;
+
+        if cid != client_id {
+            None
+        } else {
+            Some(tx)
+        }
     }
 
     fn upsert(&mut self, client_id: u16, tx_id: u32, tx: TxState) -> Result<()> {
         let transactions = &mut self.lock().unwrap().transactions;
-        match transactions.get_mut(&client_id) {
-            Some(client_txs) => {
-                client_txs.insert(tx_id, tx);
+        match transactions.get_mut(&tx_id) {
+            Some((cid, _)) => {
+                if *cid != client_id {
+                    bail!("transaction exists for different client");
+                }
+
+                transactions.insert(tx_id, (client_id, tx));
                 Ok(())
             }
             None => {
-                let mut client_txs: HashMap<u32, TxState> = HashMap::new();
-                client_txs.insert(tx_id, tx);
-                transactions.insert(client_id, client_txs);
+                transactions.insert(tx_id, (client_id, tx));
                 Ok(())
             }
         }

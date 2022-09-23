@@ -128,6 +128,12 @@ impl<T: TxStore> Client<T> {
                     bail!("insufficient funds for withdrawal");
                 }
 
+                if self.store.get(self.id, event.tx()).is_some() {
+                    bail!("cannot overwrite existing transaction");
+                }
+
+                self.store
+                    .upsert(self.id, event.tx(), TxState::Withdrawal)?;
                 self.available -= amount;
                 self.total -= amount;
             }
@@ -147,6 +153,7 @@ impl<T: TxStore> Client<T> {
                         self.available -= amount;
                     }
                     TxState::Dispute(_) => bail!("transaction already disputed"),
+                    TxState::Withdrawal => bail!("cannot dispute a withdrawal"),
                 }
             }
             EventType::Resolve => {
@@ -160,7 +167,9 @@ impl<T: TxStore> Client<T> {
                             .upsert(self.id, event.tx(), TxState::Deposit(amount))?;
                         self.available += amount;
                     }
-                    TxState::Deposit(_) => bail!("transaction is not disputed"),
+                    TxState::Deposit(_) | TxState::Withdrawal => {
+                        bail!("transaction is not disputed")
+                    }
                 }
             }
             EventType::Chargeback => {
@@ -173,11 +182,322 @@ impl<T: TxStore> Client<T> {
                         self.total -= amount;
                         self.locked = true;
                     }
-                    TxState::Deposit(_) => bail!("transaction is not disputed"),
+                    TxState::Deposit(_) | TxState::Withdrawal => {
+                        bail!("transaction is not disputed")
+                    }
                 }
             }
         };
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use crate::MemoryStore;
+    use crate::Record;
+
+    fn event_with_client(t: &str, client: u16, tx: u32, amount: Option<f32>) -> Event {
+        Event::try_from(Record {
+            r#type: t.to_string(),
+            client,
+            tx,
+            amount,
+        })
+        .unwrap()
+    }
+
+    fn event(t: &str, tx: u32, amount: Option<f32>) -> Event {
+        event_with_client(t, 1337, tx, amount)
+    }
+
+    #[test]
+    fn test_deposit() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(1.0))).unwrap();
+        assert_eq!(client.available(), 1.0);
+        assert_eq!(client.held(), 0.0);
+        assert_eq!(client.total(), 1.0);
+        assert_eq!(client.locked(), false);
+
+        client.update(&event("deposit", 2, Some(10.0))).unwrap();
+        assert_eq!(client.available(), 11.0);
+        assert_eq!(client.held(), 0.0);
+        assert_eq!(client.total(), 11.0);
+        assert_eq!(client.locked(), false);
+    }
+
+    #[test]
+    fn test_deposit_same_tx() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        if let Ok(_) = client.update(&event("deposit", 1, Some(5.0))) {
+            panic!("deposit with pre-existing tx id expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_hijack_deposit() {
+        let store = MemoryStore::new();
+        let mut client = Client::new(1337, Arc::clone(&store));
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+
+        let mut client = Client::new(1234, Arc::clone(&store));
+        if let Ok(_) = client.update(&event_with_client("deposit", 1234, 1, Some(10.0))) {
+            panic!("expected deposit of pre-existing tx id for different client to fail")
+        }
+    }
+
+    #[test]
+    fn test_double_deposit() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        let deposit_event = event("deposit", 1, Some(1.0));
+        client.update(&deposit_event).unwrap();
+        if let Ok(_) = client.update(&deposit_event) {
+            panic!("expected duplicate deposit to fail");
+        }
+    }
+
+    #[test]
+    fn test_deposit_frozen() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(1.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("chargeback", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("deposit", 2, Some(10.0))) {
+            panic!("expected deposit to fail for frozen client");
+        }
+    }
+
+    #[test]
+    fn test_withdrawal() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("withdrawal", 2, Some(9.5))).unwrap();
+        assert_eq!(client.available(), 0.5);
+        assert_eq!(client.held(), 0.0);
+        assert_eq!(client.total(), 0.5);
+        assert_eq!(client.locked(), false);
+
+        client.update(&event("withdrawal", 3, Some(0.5))).unwrap();
+        assert_eq!(client.available(), 0.0);
+        assert_eq!(client.held(), 0.0);
+        assert_eq!(client.total(), 0.0);
+        assert_eq!(client.locked(), false);
+    }
+
+    #[test]
+    fn test_withdrawal_same_tx() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        if let Ok(_) = client.update(&event("withdrawal", 1, Some(5.0))) {
+            panic!("withdrawal with pre-existing tx id expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_withdrawal_unowned_tx() {
+        let store = MemoryStore::new();
+        let mut client = Client::new(1337, Arc::clone(&store));
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+
+        let mut client = Client::new(1234, Arc::clone(&store));
+        if let Ok(_) = client.update(&event_with_client("withdrawal", 1234, 1, Some(10.0))) {
+            panic!("expected withdrawal of tx associated with different client to fail")
+        }
+    }
+
+    #[test]
+    fn test_withdrawal_insufficient() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        if let Ok(_) = client.update(&event("withdrawal", 2, Some(11.0))) {
+            panic!("overdraft expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_withdrawal_insufficient_held() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("withdrawal", 2, Some(5.0))) {
+            panic!("withdrawal of held funds expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_withdrawal_partial_held() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(5.0))).unwrap();
+        client.update(&event("deposit", 2, Some(6.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("withdrawal", 3, Some(5.0))).unwrap();
+        assert_eq!(client.available(), 1.0);
+        assert_eq!(client.held(), 5.0);
+        assert_eq!(client.total(), 6.0);
+        assert_eq!(client.locked(), false);
+    }
+
+    #[test]
+    fn test_withdrawal_frozen() {
+        let mut client = Client::new(1337, MemoryStore::new());
+        client.update(&event("deposit", 1, Some(5.0))).unwrap();
+        client.update(&event("deposit", 2, Some(6.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("chargeback", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("withdrawal", 3, Some(1.0))) {
+            panic!("withdrawal from frozen account expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_dispute() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("deposit", 2, Some(5.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        assert_eq!(client.available(), 5.0);
+        assert_eq!(client.held(), 10.0);
+        assert_eq!(client.total(), 15.0);
+        assert_eq!(client.locked(), false);
+    }
+
+    #[test]
+    fn test_double_dispute() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("dispute", 1, None)) {
+            panic!("disputing the same transaction multiple times expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_dispute_unowned_tx() {
+        let store = MemoryStore::new();
+        let mut client = Client::new(1337, Arc::clone(&store));
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+
+        let mut client = Client::new(1234, Arc::clone(&store));
+        if let Ok(_) = client.update(&event_with_client("dispute", 1234, 1, None)) {
+            panic!("dispute tx associated with different client expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_dispute_frozen() {
+        let mut client = Client::new(1337, MemoryStore::new());
+        client.update(&event("deposit", 1, Some(5.0))).unwrap();
+        client.update(&event("deposit", 2, Some(6.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("chargeback", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("dispute", 2, None)) {
+            panic!("dispute tx associated with frozen account expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_resolve() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("resolve", 1, None)).unwrap();
+        assert_eq!(client.available(), 10.0);
+        assert_eq!(client.held(), 0.0);
+        assert_eq!(client.total(), 10.0);
+        assert_eq!(client.locked(), false);
+    }
+
+    #[test]
+    fn test_double_resolve() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("resolve", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("resolve", 1, None)) {
+            panic!("resolving the same transaction multiple times expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_resolve_unowned_tx() {
+        let store = MemoryStore::new();
+        let mut client = Client::new(1337, Arc::clone(&store));
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+
+        let mut client = Client::new(1234, Arc::clone(&store));
+        if let Ok(_) = client.update(&event_with_client("resolve", 1234, 1, None)) {
+            panic!("resolve tx associated with different client expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_resolve_frozen() {
+        let mut client = Client::new(1337, MemoryStore::new());
+        client.update(&event("deposit", 1, Some(5.0))).unwrap();
+        client.update(&event("deposit", 2, Some(6.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("chargeback", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("resolve", 1, None)) {
+            panic!("resolve tx associated with frozen account expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_chargeback() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("chargeback", 1, None)).unwrap();
+        assert_eq!(client.available(), 0.0);
+        assert_eq!(client.held(), 0.0);
+        assert_eq!(client.total(), 0.0);
+        assert_eq!(client.locked(), true);
+    }
+
+    #[test]
+    fn test_double_chargeback() {
+        let mut client = Client::new(1337, MemoryStore::new());
+
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+        client.update(&event("chargeback", 1, None)).unwrap();
+        if let Ok(_) = client.update(&event("chargeback", 1, None)) {
+            panic!("chargeback the same transaction multiple times expected to fail")
+        }
+    }
+
+    #[test]
+    fn test_chargeback_unowned_tx() {
+        let store = MemoryStore::new();
+        let mut client = Client::new(1337, Arc::clone(&store));
+        client.update(&event("deposit", 1, Some(10.0))).unwrap();
+        client.update(&event("dispute", 1, None)).unwrap();
+
+        let mut client = Client::new(1234, Arc::clone(&store));
+        if let Ok(_) = client.update(&event_with_client("chargeback", 1234, 1, None)) {
+            panic!("chargeback tx associated with different client expected to fail")
+        }
     }
 }

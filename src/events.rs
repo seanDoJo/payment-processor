@@ -116,12 +116,26 @@ impl TryFrom<Record> for Event {
                 "deposit" => EventType::Deposit(
                     record
                         .amount
-                        .ok_or_else(|| anyhow!("deposit requires an amount"))?,
+                        .ok_or_else(|| anyhow!("deposit requires an amount"))
+                        .and_then(|amount| {
+                            if amount > 0.0 {
+                                Ok(amount)
+                            } else {
+                                bail!("deposit amounts must be positive")
+                            }
+                        })?,
                 ),
                 "withdrawal" => EventType::Withdrawal(
                     record
                         .amount
-                        .ok_or_else(|| anyhow!("withdrawal requires an  amount"))?,
+                        .ok_or_else(|| anyhow!("withdrawal requires an  amount"))
+                        .and_then(|amount| {
+                            if amount > 0.0 {
+                                Ok(amount)
+                            } else {
+                                bail!("withdrawal amounts must be positive")
+                            }
+                        })?,
                 ),
                 "dispute" => EventType::Dispute,
                 "resolve" => EventType::Resolve,

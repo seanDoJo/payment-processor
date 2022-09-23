@@ -71,7 +71,7 @@ fn main() {
         .into_values()
         .map(|client| {
             format!(
-                "{},{},{},{},{}",
+                "{},{:.4},{:.4},{:.4},{}",
                 client.id(),
                 client.available(),
                 client.held(),
