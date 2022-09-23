@@ -2,6 +2,7 @@
 
 # Assumptions Made
 - Disputes and chargebacks made against accounts with insufficient funds (i.e. resulting in negative account balances) are forbidden
+- Disputes and chargebacks made against accounts which are frozen are forbidden
 - Deposits and withdrawals with amounts <= 0 are forbidden
 
 # Running the utility
